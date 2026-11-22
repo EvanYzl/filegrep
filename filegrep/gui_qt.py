@@ -30,7 +30,7 @@ from PySide6.QtCore import (QFileInfo, QObject, QRect, QSettings, QSize, Qt, QTh
 from PySide6.QtGui import (QAction, QColor, QFont, QFontDatabase, QFontMetrics, QIcon,
                            QKeySequence, QPainter, QPalette, QShortcut, QTextCharFormat,
                            QTextCursor)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
                                QFileDialog, QFileIconProvider, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem,
                                QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
 
 from .engine import (DEFAULT_EXCLUDES, KIND_GROUPS, FileResult, SearchConfig,
                      SearchEngine, SearchReport, load_document, looks_like_regex)
+from .geo import CONF_LABEL, Coord, extract_coordinates, to_csv
 from .extract import ExtractContext, supported_suffixes
 
 APP_NAME = "FileGrep"
@@ -897,6 +898,129 @@ class DbPanel(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# 经纬度提取对话框
+# ---------------------------------------------------------------------------
+
+class CoordDialog(QDialog):
+    """列出当前文件里所有疑似经纬度坐标。"""
+
+    gotoRequested = Signal(int)      # 文档偏移
+
+    COLS = ["序号", "纬度", "经度", "格式", "置信度", "行号", "原文"]
+
+    def __init__(self, doc, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"经纬度坐标 · {os.path.basename(getattr(doc, 'path', '') or '')}")
+        self.resize(1080, 620)
+        self.setStyleSheet(STYLE)
+        self.doc = doc
+        self.coords: List[Coord] = []
+        self._max_rows = 5000
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
+
+        opt = QHBoxLayout()
+        opt.setSpacing(10)
+        self.cb_same_line = QCheckBox("只认同一行的经纬度")
+        self.cb_same_line.setChecked(True)
+        self.cb_same_line.setToolTip(
+            "勾选：同一行内出现经度和纬度才算一个坐标点\n"
+            "取消：允许相邻几行配对（如 latitude 一行、longitude 下一行）")
+        self.conf_combo = QComboBox()
+        self.conf_combo.addItem("最低置信度：中", "medium")
+        self.conf_combo.addItem("最低置信度：高（只要标签/方向/度分秒）", "high")
+        self.conf_combo.addItem("最低置信度：低（全部）", "low")
+        btn_reload = QPushButton("重新提取")
+        btn_reload.clicked.connect(self.run_extract)
+        btn_export = QPushButton("导出 CSV")
+        btn_export.clicked.connect(self.export_csv)
+        self.info = QLabel("")
+        self.info.setObjectName("hint")
+        opt.addWidget(self.cb_same_line)
+        opt.addWidget(self.conf_combo)
+        opt.addWidget(btn_reload)
+        opt.addWidget(self.info, 1)
+        opt.addWidget(btn_export)
+        root.addLayout(opt)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(len(self.COLS))
+        self.table.setHorizontalHeaderLabels(self.COLS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.itemDoubleClicked.connect(self._on_double)
+        root.addWidget(self.table, 1)
+
+        tip = QLabel("双击任意一行可跳转到该坐标在文件中的位置")
+        tip.setObjectName("hint")
+        root.addWidget(tip)
+
+        self.cb_same_line.toggled.connect(lambda _v: self.run_extract())
+        self.conf_combo.currentIndexChanged.connect(lambda _i: self.run_extract())
+        self.run_extract()
+
+    def run_extract(self) -> None:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            text = getattr(self.doc, "text", "") or ""
+            self.coords = extract_coordinates(
+                text,
+                same_line_only=self.cb_same_line.isChecked(),
+                min_confidence=self.conf_combo.currentData() or "medium",
+            )
+            self._fill()
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _fill(self) -> None:
+        rows = self.coords[: self._max_rows]
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.clearContents()
+            self.table.setRowCount(len(rows))
+            for r, c in enumerate(rows):
+                raw = c.raw if len(c.raw) <= 200 else c.raw[:200] + "…"
+                values = [str(r + 1), f"{c.lat:.6f}", f"{c.lon:.6f}", c.fmt,
+                          CONF_LABEL.get(c.conf, c.conf), str(c.line_no), raw]
+                for col, val in enumerate(values):
+                    item = QTableWidgetItem(val)
+                    if col in (1, 2):
+                        item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                    self.table.setItem(r, col, item)
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.table.resizeColumnsToContents()
+            self.table.horizontalHeader().setStretchLastSection(True)
+        extra = ""
+        if len(self.coords) > len(rows):
+            extra = f"（仅显示前 {len(rows)} 个，导出含全部）"
+        self.info.setText(f"共 {len(self.coords)} 个坐标点 {extra}".strip())
+
+    def _on_double(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        if 0 <= row < len(self.coords):
+            self.gotoRequested.emit(self.coords[row].start)
+
+    def export_csv(self) -> None:
+        if not self.coords:
+            return
+        base = os.path.splitext(os.path.basename(self.doc.path))[0]
+        path, _ = QFileDialog.getSaveFileName(self, "导出坐标",
+                                              os.path.expanduser(f"~/{base}_coords.csv"),
+                                              "CSV (*.csv)")
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(to_csv(self.coords))
+        self.info.setText(f"已导出 {len(self.coords)} 个坐标点到 {path}")
+
+
+# ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
 
@@ -1253,6 +1377,9 @@ class MainWindow(QMainWindow):
         a6 = QAction("支持的文件类型…", self)
         a6.triggered.connect(self.show_types)
         m_tools.addAction(a6)
+        a_coord = QAction("提取经纬度坐标（当前文件）…", self)
+        a_coord.triggered.connect(self.extract_coords)
+        m_tools.addAction(a_coord)
         a_reset = QAction("重置搜索选项", self)
         a_reset.triggered.connect(self.reset_options)
         m_tools.addAction(a_reset)
@@ -2156,6 +2283,37 @@ class MainWindow(QMainWindow):
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         self.statusBar().showMessage(f"已导出 {len(data)} 条到 {path}", 6000)
+
+    def extract_coords(self) -> None:
+        if self.current_doc is None:
+            self._flash("请先打开一个文件")
+            return
+        dlg = CoordDialog(self.current_doc, self)
+        dlg.gotoRequested.connect(self.goto_offset)
+        dlg.exec()
+
+    def goto_offset(self, offset: int) -> None:
+        """把预览滚动到指定偏移（不改变筛选条件）。"""
+        text = self._full_text
+        if not text or self.current_doc is None:
+            return
+        base, window, line_offset = self._window_slice(max(0, min(offset, len(text))))
+        self._window_base = base
+        self.editor.blockSignals(True)
+        try:
+            self.editor.setPlainText(safe_text(window))
+        finally:
+            self.editor.blockSignals(False)
+        self.editor.set_line_offset(line_offset)
+        self.editor.setExtraSelections([])
+        pos = max(0, min(len(window), offset - base))
+        nav = QTextCursor(self.editor.document())
+        nav.setPosition(pos)
+        self.editor.setTextCursor(nav)
+        self.editor.ensureCursorVisible()
+        QTimer.singleShot(0, self._center_on_hit)
+        line_no = self.current_doc.line_of(offset)
+        self.preview_title.setText(f"{os.path.basename(self.current_doc.path)} · 第 {line_no} 行")
 
     def clear_cache(self) -> None:
         from .cache import get_cache

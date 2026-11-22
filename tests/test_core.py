@@ -176,6 +176,60 @@ class TestSearch(unittest.TestCase):
                 self.assertIn(h.matched.lower(), ("admin",))
 
 
+class TestGeo(unittest.TestCase):
+    """经纬度提取：多格式识别 + 常见误报排除。"""
+
+    def _one(self, text, **kw):
+        from filegrep.geo import extract_coordinates
+        return extract_coordinates(text, **kw)
+
+    def test_formats(self):
+        cases = {
+            "116.397, 39.909": (39.909, 116.397),
+            "39.909, 116.397": (39.909, 116.397),
+            "(116.397,39.909)": (39.909, 116.397),
+            "[116.397, 39.909]": (39.909, 116.397),
+            "39.909°N, 116.397°E": (39.909, 116.397),
+            "N39.909 E116.397": (39.909, 116.397),
+            '39°54\'33"N 116°23\'29"E': (39.9092, 116.3914),
+            "39°54.5'N 116°23.5'E": (39.9083, 116.3917),
+            "lat: 39.909, lng: 116.397": (39.909, 116.397),
+            "latitude=39.909 longitude=116.397": (39.909, 116.397),
+            "纬度 39.909 经度 116.397": (39.909, 116.397),
+            "pos=(22.5431,114.0579)": (22.5431, 114.0579),
+            "-33.8688, 151.2093": (-33.8688, 151.2093),
+        }
+        for text, (lat, lon) in cases.items():
+            got = self._one(text)
+            self.assertEqual(len(got), 1, f"{text!r} 应识别为 1 个坐标，实际 {got}")
+            self.assertAlmostEqual(got[0].lat, lat, places=3, msg=text)
+            self.assertAlmostEqual(got[0].lon, lon, places=3, msg=text)
+
+    def test_far_apart_on_same_line(self):
+        got = self._one("31.2304 lots of text in between 121.4737 tail")
+        self.assertEqual(len(got), 1)
+        self.assertAlmostEqual(got[0].lat, 31.2304, places=4)
+        self.assertAlmostEqual(got[0].lon, 121.4737, places=4)
+
+    def test_no_false_positive(self):
+        for text in ("2024-01-01 10:53:06.071", "192.168.1.88", "version 3.5.62",
+                     "id=12345 count=98765", "position 2024 and near 1.5"):
+            self.assertEqual(len(self._one(text)), 0, f"{text!r} 不应识别为坐标")
+
+    def test_same_line_option(self):
+        multi = "latitude: 39.909\nlongitude: 116.397"
+        self.assertEqual(len(self._one(multi)), 0)
+        got = self._one(multi, same_line_only=False)
+        self.assertEqual(len(got), 1)
+        self.assertAlmostEqual(got[0].lat, 39.909, places=3)
+        self.assertAlmostEqual(got[0].lon, 116.397, places=3)
+
+    def test_confidence_filter(self):
+        text = "lat=39.909 lon=116.397\n116.397,39.909"
+        self.assertEqual(len(self._one(text, min_confidence="high")), 1)
+        self.assertEqual(len(self._one(text, min_confidence="medium")), 2)
+
+
 class TestCache(unittest.TestCase):
     def test_roundtrip_and_invalidation(self):
         tmp = tempfile.mkdtemp()

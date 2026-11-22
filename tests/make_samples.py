@@ -132,7 +132,17 @@ def main() -> int:
                 f.write(f"2024-01-01 00:00:{i%60:02d} INFO request id={i} user=u{i%50} ip=10.0.0.{i%255}\n")
             f.write("2024-01-01 23:59:59 ERROR login failed for 张三 from 192.168.1.88\n")
 
-    # 14. 二进制（模拟镜像，含 ASCII 串）
+    # 14. 经纬度日志（多种写法，供坐标提取测试）
+    with open(os.path.join(OUT, "gps.log"), "w", encoding="utf-8") as f:
+        f.write("07-16 10:00:00 gps lat=39.9042 lon=116.4074 alt=43\n")
+        f.write("07-16 10:00:01 poi 116.397,39.909 near station\n")
+        f.write("07-16 10:00:02 dms 39\u00b054'33\"N 116\u00b023'29\"E\n")
+        f.write("07-16 10:00:03 纬度 22.5431 经度 114.0579\n")
+        f.write("07-16 10:00:04 nothing here 1234 5678\n")
+        f.write("07-16 10:00:05 ip 192.168.1.88 time 10:53:06.071\n")
+        f.write("07-16 10:00:06 wide 31.2304 lots of text in between 121.4737 tail\n")
+
+    # 15. 二进制（模拟镜像，含 ASCII 串）
     with open(os.path.join(OUT, "raw.bin"), "wb") as f:
         f.write(b"\x00\x01\x02" * 1000 + b"\x00" + b"password=secret_token_9f3a\x00" + b"\x7f" * 500)
 

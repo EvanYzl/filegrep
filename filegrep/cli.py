@@ -60,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-c", "--count", action="store_true", help="只输出计数")
     p.add_argument("-l", "--files-only", action="store_true", help="只输出命中的文件名")
     p.add_argument("--stats", action="store_true", help="显示统计信息")
+    p.add_argument("--coords", action="store_true", help="提取经纬度坐标（不做内容搜索）")
+    p.add_argument("--coords-anywhere", action="store_true",
+                   help="允许跨行配对经纬度（默认要求同一行）")
+    p.add_argument("--coords-min-conf", default="medium", choices=["high", "medium", "low"],
+                   help="坐标最低置信度（默认 medium）")
     p.add_argument("--list-types", action="store_true", help="列出支持的文件类型并退出")
     p.add_argument("--no-color", action="store_true", help="禁用颜色")
     return p
@@ -140,6 +145,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_file_size=args.max_size * 1024 * 1024,
     )
 
+    if args.coords:
+        return _coords_mode(args, cfg, paths)
+
     color = not args.no_color and sys.stdout.isatty()
     if args.json:
         collected = []
@@ -195,6 +203,56 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.stats:
         print(report.describe(), file=sys.stderr)
     return 0 if report.total_hits else 1
+
+
+def _coords_mode(args, cfg, paths) -> int:
+    """遍历文件并输出其中所有疑似经纬度坐标。"""
+    import zipfile
+    from .engine import iter_files
+    from .extract import ExtractContext, Source, extract_source
+    from .geo import extract_coordinates, to_csv
+    from .model import Document
+
+    ctx = ExtractContext(raw_strings=args.deep, archive_depth=1 if args.archives else 0)
+    rows = []
+    total = 0
+    files = 0
+    for task in iter_files(cfg):
+        path, rel, size, mtime, member = task
+        try:
+            if member is not None:
+                with zipfile.ZipFile(path) as zf:
+                    data = zf.read(member)
+                doc = extract_source(Source(f"{path}::{member}", data=data), ctx)
+                display = f"{rel}::{member}"
+            else:
+                doc = extract_source(Source(path), ctx)
+                display = rel
+        except Exception as exc:                            # noqa: BLE001
+            if args.stats:
+                print(f"跳过 {rel}: {exc}", file=sys.stderr)
+            continue
+        if not doc.text:
+            continue
+        coords = extract_coordinates(doc.text,
+                                     same_line_only=not args.coords_anywhere,
+                                     min_confidence=args.coords_min_conf)
+        if coords:
+            files += 1
+        total += len(coords)
+        for c in coords:
+            if args.json:
+                rows.append({"file": display, "line": c.line_no, "lat": c.lat, "lon": c.lon,
+                             "fmt": c.fmt, "conf": c.conf, "raw": c.raw.strip()})
+            else:
+                print(f"{display}:{c.line_no}: {c.lat:.6f},{c.lon:.6f} "
+                      f"[{c.fmt}/{c.conf}] {c.raw.strip()[:120]}")
+    if args.json:
+        print(json.dumps({"files_with_coords": files, "total": total, "coords": rows},
+                         ensure_ascii=False, indent=2))
+    elif args.stats:
+        print(f"共 {total} 个坐标点，分布在 {files} 个文件", file=sys.stderr)
+    return 0 if total else 1
 
 
 if __name__ == "__main__":  # pragma: no cover
