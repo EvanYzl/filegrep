@@ -33,7 +33,10 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["smart", "ignore", "sensitive"],
                    help="大小写模式（默认 smart：含大写字母就区分）")
     p.add_argument("-w", "--word", action="store_true", help="整词匹配")
-    p.add_argument("-F", "--literal", action="store_true", help="按字面量匹配（不当正则）")
+    p.add_argument("-F", "--literal", action="store_true", help="等同 --mode text")
+    p.add_argument("--mode", dest="match_mode", default="smart",
+                   choices=["smart", "text", "regex"],
+                   help="匹配方式：smart=像正则才当正则（默认），text=纯文字，regex=始终正则")
     p.add_argument("--no-multiline", dest="multiline", action="store_false", default=True,
                    help="^ $ 不按行匹配")
     p.add_argument("--no-dotall", dest="dotall", action="store_false", default=True,
@@ -119,6 +122,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         ignore_case=args.ignore_case,
         whole_word=args.word,
         literal=args.literal,
+        match_mode=("text" if args.literal else args.match_mode),
         multiline=args.multiline,
         dotall=args.dotall,
         whitelist_exts=exts,

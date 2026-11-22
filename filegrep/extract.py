@@ -1195,7 +1195,7 @@ def extract_zip(src: Source, ctx: ExtractContext) -> Document:
             sub_src = Source(f"{src.name}::{member}", data=b"")
             # 只对可解析类型递归，其余跳过（避免无谓内存开销）
             sub_suffix = os.path.splitext(member)[1].lower()
-            if sub_suffix not in _REGISTRY or info.file_size > 64 * 1024 * 1024:
+            if sub_suffix in _SKIP_MEMBER_SUFFIXES or info.file_size > 64 * 1024 * 1024:
                 continue
             try:
                 data = zf.read(info)
@@ -1218,6 +1218,17 @@ def extract_zip(src: Source, ctx: ExtractContext) -> Document:
 # ---------------------------------------------------------------------------
 # 原始字符串扫描（任意二进制：E01/镜像/未知库/损坏文件）
 # ---------------------------------------------------------------------------
+
+# 与 engine.SKIP_MEMBER_SUFFIXES 保持一致（此模块不反向依赖 engine）
+_SKIP_MEMBER_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tif", ".tiff", ".heic",
+    ".mp3", ".mp4", ".avi", ".mkv", ".mov", ".wav", ".flac", ".ogg", ".webm", ".m4a", ".aac",
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    ".zip", ".7z", ".rar", ".gz", ".bz2", ".xz", ".tar", ".jar", ".apk", ".ipa",
+    ".whl", ".egg", ".vsix", ".xpi", ".so", ".dylib", ".dll", ".exe", ".class",
+    ".dex", ".o", ".a", ".obj", ".lib", ".pyc",
+    ".keystore", ".jks", ".p12", ".pfx", ".der",
+}
 
 _ASCII_RE = re.compile(rb"[\x20-\x7e\t]{4,}")
 _UTF16_RE = re.compile(r"(?:[\x20-\x7e\u00a0-\uffff]\x00){4,}")
@@ -1363,6 +1374,16 @@ def extract_source(src: Source, ctx: Optional[ExtractContext] = None) -> Documen
     except Exception as e:  # noqa: BLE001 - 批量扫描保底
         err = f"{type(e).__name__}: {e}"
 
+    if (doc is None and fn is not None and fn is not extract_text
+            and src.suffix not in _REGISTRY and src.size <= 64 * 1024 * 1024):
+        # 未知后缀：即使 sniff 没判定为文本，也试一次解码，用文本质量分过滤乱码
+        try:
+            cand = extract_text(src, ctx)
+            if cand.text.strip() and _text_score(cand.text[:8000]) > 0.62:
+                doc = cand
+                err = None
+        except Exception:
+            pass
     if doc is None and _FALLBACK_CONVERTER is not None and src.size <= 32 * 1024 * 1024:
         # 兜底零：markitdown 万能格式转换（覆盖 WPS/旧版 Office/图片元数据等）
         try:

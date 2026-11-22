@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .engine import (DEFAULT_EXCLUDES, KIND_GROUPS, FileResult, SearchConfig,
-                     SearchEngine, SearchReport, load_document)
+                     SearchEngine, SearchReport, load_document, looks_like_regex)
 from .extract import ExtractContext, supported_suffixes
 
 APP_NAME = "FileGrep"
@@ -974,8 +974,14 @@ class MainWindow(QMainWindow):
         self.case_combo.setToolTip("智能：正则里出现大写字母就区分大小写（推荐）")
         self.cb_word = QCheckBox("整词")
         self.cb_word.setToolTip("只匹配完整单词（给表达式两端加词边界）")
-        self.cb_literal = QCheckBox("字面量")
-        self.cb_literal.setToolTip("把输入当成纯文本查找，特殊符号不再按正则解释")
+        self.match_combo = QComboBox()
+        self.match_combo.addItem("智能匹配", "smart")
+        self.match_combo.addItem("纯文字", "text")
+        self.match_combo.addItem("正则", "regex")
+        self.match_combo.setToolTip(
+            "智能匹配：输入像普通文字就直接找文字，像正则才按正则（推荐）\n"
+            "纯文字：所有符号原样查找\n"
+            "正则：始终按正则表达式")
         self.cb_deep = QCheckBox("二进制字符串")
         self.cb_deep.setToolTip("对无法解析的二进制文件（镜像、未知库）做可打印字符串扫描")
         self.cb_arch = QCheckBox("压缩包内部")
@@ -1009,8 +1015,9 @@ class MainWindow(QMainWindow):
         self.btn_retry_enc.setVisible(False)
         self.btn_retry_enc.setToolTip("用当前口令重新搜索被跳过的加密内容")
         self.btn_retry_enc.clicked.connect(self.start_search)
-        for w in (self.cb_word, self.cb_literal, self.cb_deep, self.cb_arch, self.cb_cache):
+        for w in (self.cb_word, self.cb_deep, self.cb_arch, self.cb_cache):
             row3.addWidget(w)
+        row3.addWidget(self.match_combo)
         row3.addWidget(self.case_combo)
         row3.addSpacing(8)
         row3.addWidget(QLabel("类型"))
@@ -1118,7 +1125,7 @@ class MainWindow(QMainWindow):
         root.addLayout(bottom)
         self.setCentralWidget(central)
 
-        self.cb_literal.toggled.connect(self._on_literal_toggled)
+        self.match_combo.currentIndexChanged.connect(self._on_match_mode_changed)
 
         # 快捷键
         for seq, fn in (
@@ -1189,8 +1196,8 @@ class MainWindow(QMainWindow):
         if self.pattern_combo.count():
             self.pattern_combo.setCurrentIndex(0)
         self.case_combo.setCurrentIndex(max(0, min(s.value("case_mode", 0, type=int), 2)))
+        self.match_combo.setCurrentIndex(max(0, min(s.value("match_mode", 0, type=int), 2)))
         self.cb_word.setChecked(False)
-        self.cb_literal.setChecked(False)
         self.cb_deep.setChecked(False)
         self.cb_arch.setChecked(s.value("archives", True, type=bool))
         self.cb_cache.setChecked(s.value("cache", True, type=bool))
@@ -1210,7 +1217,8 @@ class MainWindow(QMainWindow):
         hist = [self.pattern_combo.itemText(i) for i in range(self.pattern_combo.count())][:30]
         s.setValue("history", hist)
         s.setValue("case_mode", self.case_combo.currentIndex())
-        # 「整词 / 字面量 / 二进制字符串」不持久化：每次启动都从关闭开始
+        s.setValue("match_mode", self.match_combo.currentIndex())
+        # 「整词 / 二进制字符串」不持久化：每次启动都从关闭开始
         s.setValue("archives", self.cb_arch.isChecked())
         s.setValue("cache", self.cb_cache.isChecked())
         s.setValue("type", self.type_combo.currentText())
@@ -1280,7 +1288,7 @@ class MainWindow(QMainWindow):
             ignore_case=self.case_combo.currentData() == "ignore",
             case_mode=self.case_combo.currentData() or "smart",
             whole_word=self.cb_word.isChecked(),
-            literal=self.cb_literal.isChecked(),
+            match_mode=self.match_combo.currentData() or "smart",
             multiline=True, dotall=True,
             whitelist_exts=self._exts(),
             exclude_globs=list(DEFAULT_EXCLUDES),
@@ -1313,14 +1321,13 @@ class MainWindow(QMainWindow):
             self.pattern_combo.setStyleSheet("border:1px solid #d93025;")
             self._flash(f"正则无效：{e}")
             return
-        if cfg.literal and re.search(r"\(\?|\[|\{", cfg.pattern):
+        if cfg.match_mode == "text" and looks_like_regex(cfg.pattern):
             self.pattern_combo.setStyleSheet("border:1px solid #d9a03a;")
             self.statusBar().showMessage(
-                "提醒：「字面量」已勾选，表达式里的 (?<! [ ] 会按普通字符处理，多半搜不到。"
-                "请取消勾选「字面量」后再搜。", 15000)
-            self._flash("请先取消勾选「字面量」")
-            return
-        self.pattern_combo.setStyleSheet("")
+                "当前是「纯文字」模式：输入里的 (? [ { 会按原样查找。"
+                "若想用正则，请把匹配方式切成「智能匹配」或「正则」。", 15000)
+        else:
+            self.pattern_combo.setStyleSheet("")
         self.zip_pwd_edit.setStyleSheet("")
         self._cfg_last = cfg
         self._remember_pattern(cfg.pattern)
@@ -1463,26 +1470,27 @@ class MainWindow(QMainWindow):
                 self.tree.setCurrentItem(top.child(0))
                 self.show_hit(top.child(0).data(0, Qt.ItemDataRole.UserRole + 1))
 
-    def _on_literal_toggled(self, on: bool) -> None:
-        if on:
-            self.pattern_combo.setStyleSheet("border:1px solid #d9a03a;")
+    def _on_match_mode_changed(self, _idx: int = 0) -> None:
+        mode = self.match_combo.currentData()
+        self.pattern_combo.setStyleSheet("")
+        if mode == "text":
             self.pattern_combo.lineEdit().setPlaceholderText(
-                "字面量模式：按普通文本匹配，正则符号（(?<! [ ] { } | \\）不生效")
-            self.statusBar().showMessage(
-                "已开启「字面量」：表达式会被当作普通文本。要按正则搜索请取消勾选。", 10000)
-        else:
-            self.pattern_combo.setStyleSheet("")
+                "纯文字匹配：特殊符号（(?<! [ ] { } | \\）按原样查找")
+        elif mode == "regex":
             self.pattern_combo.lineEdit().setPlaceholderText(
                 r"正则表达式，例如  张三|138\d{8}    或    (?i)password\s*=")
+        else:
+            self.pattern_combo.lineEdit().setPlaceholderText(
+                "直接输入要查找的文字，也可以写正则——会自动判断")
 
     def reset_options(self) -> None:
         """一键把容易误触的开关恢复到默认。"""
         self.cb_word.setChecked(False)
-        self.cb_literal.setChecked(False)
         self.cb_deep.setChecked(False)
         self.cb_arch.setChecked(True)
         self.cb_cache.setChecked(True)
         self.case_combo.setCurrentIndex(0)
+        self.match_combo.setCurrentIndex(0)
         self.type_combo.setCurrentIndex(0)
         self.backend_combo.setCurrentIndex(0)
         self.workers_spin.setValue(0)

@@ -62,6 +62,25 @@ KIND_GROUPS: Dict[str, Tuple[str, ...]] = {
 }
 
 
+_REGEX_SIGNALS = re.compile(
+    r"\\[dDwWsSbBAZzG0-9.]"      # \d \w \. 等转义
+    r"|\(\?"                     # (?: (?= (?<!
+    r"|\[[^\]]*\]"              # [abc]
+    r"|\{\d+(?:,\d*)?\}"       # {8} {1,3}
+    r"|\.\*|\.\+|\.\?"       # .* .+ .?
+    r"|^\^"                       # 开头 ^
+    r"|(?<!\\)\$"               # 结尾 $
+    r"|(?<!\\)\|"               # a|b
+)
+
+
+def looks_like_regex(pattern: str) -> bool:
+    """粗略判断输入是否包含正则语法；没有就当普通文字处理。"""
+    if not pattern:
+        return False
+    return bool(_REGEX_SIGNALS.search(pattern))
+
+
 def pattern_has_upper(pat: str) -> bool:
     """pattern 里是否出现字面大写字母（跳过 \\A 这类转义）。"""
     i = 0
@@ -86,7 +105,8 @@ class SearchConfig:
     whole_word: bool = False
     dotall: bool = True
     multiline: bool = True
-    literal: bool = False
+    literal: bool = False             # 兼容旧字段；match_mode 优先
+    match_mode: str = "smart"         # smart | text | regex
     whitelist_exts: Optional[Sequence[str]] = None
     exclude_globs: List[str] = field(default_factory=lambda: list(DEFAULT_EXCLUDES))
     include_hidden: bool = True
@@ -126,9 +146,18 @@ class SearchConfig:
             flags |= re.DOTALL
         return flags
 
+    def is_literal(self) -> bool:
+        """本次是否按纯文字匹配。"""
+        mode = self.match_mode or ("text" if self.literal else "regex")
+        if mode == "text":
+            return True
+        if mode == "regex":
+            return self.literal          # 显式字面量优先
+        return not looks_like_regex(self.pattern)
+
     def pattern_source(self) -> str:
         pat = self.pattern
-        if self.literal:
+        if self.is_literal():
             pat = re.escape(pat)
         if self.whole_word:
             pat = rf"(?<![0-9A-Za-z_])(?:{pat})(?![0-9A-Za-z_])"
@@ -170,15 +199,28 @@ ZIP_LIKE = {".zip"}
 MAX_ZIP_MEMBERS = 5000
 
 
+# 明确不含可读文本的成员类型；其它一律尝试解析（日志常见 aplog.01 / .1 这类后缀）
+SKIP_MEMBER_SUFFIXES = {
+    # 图片
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tif", ".tiff", ".heic",
+    # 音视频
+    ".mp3", ".mp4", ".avi", ".mkv", ".mov", ".wav", ".flac", ".ogg", ".webm", ".m4a", ".aac",
+    # 字体
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    # 压缩包 / 可执行 / 字节码
+    ".zip", ".7z", ".rar", ".gz", ".bz2", ".xz", ".tar", ".jar", ".apk", ".ipa",
+    ".whl", ".egg", ".vsix", ".xpi", ".so", ".dylib", ".dll", ".exe", ".class",
+    ".dex", ".o", ".a", ".obj", ".lib", ".pyc",
+    # 证书 / 密钥容器
+    ".keystore", ".jks", ".p12", ".pfx", ".der",
+}
+
+
 def _member_worth_parsing(name: str) -> bool:
-    """压缩包成员是否值得解析：无扩展名（如 aplog）、或已知文本/文档类型。"""
+    """压缩包成员是否值得解析：只跳过明确不可读的类型。"""
     base = name.rsplit("/", 1)[-1]
     suffix = os.path.splitext(base)[1].lower()
-    if not suffix:
-        return True
-    if suffix in ex._REGISTRY:
-        return True
-    return False
+    return suffix not in SKIP_MEMBER_SUFFIXES
 
 
 def _expand_zip(path: str, rel: str, st, cfg: SearchConfig) -> List[Tuple[str, str, int, int, Optional[str]]]:
