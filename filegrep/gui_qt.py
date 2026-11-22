@@ -1027,9 +1027,12 @@ class MainWindow(QMainWindow):
         self.workers_spin.setValue(0)
         self.workers_spin.setPrefix("并发 ")
         self.hits_spin = QSpinBox()
-        self.hits_spin.setRange(10, 5000)
-        self.hits_spin.setValue(300)
+        self.hits_spin.setRange(0, 1_000_000)
+        self.hits_spin.setSingleStep(50)
+        self.hits_spin.setValue(0)
+        self.hits_spin.setSpecialValueText("单文件命中 不限")
         self.hits_spin.setPrefix("单文件命中 ")
+        self.hits_spin.setToolTip("0 = 不限；需要时再设阈值，避免个别文件命中过多")
         self.zip_pwd_edit = QLineEdit()
         self.zip_pwd_edit.setPlaceholderText("zip 口令")
         self.zip_pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -1481,7 +1484,10 @@ class MainWindow(QMainWindow):
         font.setBold(True)
         top.setFont(0, font)
         self._file_hits[fr.path] = fr.hits
+        MAX_TREE_HITS = 3000
         for h in fr.hits:
+            self._hit_order.append(h)
+        for h in fr.hits[:MAX_TREE_HITS]:
             extra = ""
             cells = (h.meta or {}).get("cells")
             if cells:
@@ -1497,8 +1503,13 @@ class MainWindow(QMainWindow):
             if "行" not in h.label:
                 tip += f" · 第 {h.line_no} 行"
             child.setToolTip(1, tip)
-            self._hit_order.append(h)
             top.addChild(child)
+        if len(fr.hits) > MAX_TREE_HITS:
+            more = QTreeWidgetItem([f"… 另有 {len(fr.hits) - MAX_TREE_HITS} 条命中未在树中列出",
+                                    "", "", "可用 F3 逐个跳转，或导出 CSV/JSON 获取全部"])
+            more.setFlags(Qt.ItemFlag.NoItemFlags)
+            more.setForeground(3, QColor("#8a94a0"))
+            top.addChild(more)
         self.tree.addTopLevelItem(top)
 
     def _on_progress(self, done: int, total: int, hits: int, cached: int) -> None:
@@ -1573,7 +1584,7 @@ class MainWindow(QMainWindow):
         self.type_combo.setCurrentIndex(0)
         self.backend_combo.setCurrentIndex(0)
         self.workers_spin.setValue(0)
-        self.hits_spin.setValue(300)
+        self.hits_spin.setValue(0)
         self.statusBar().showMessage("搜索选项已重置为默认", 5000)
 
     def _on_encrypted(self, fr) -> None:
@@ -2199,7 +2210,9 @@ class MainWindow(QMainWindow):
                     shown += 1
             top.setHidden(visible == 0 and bool(parts))
         if not parts:
-            self.result_filter_info.setText(f"{total} 条" if total else "")
+            # 未过滤时报告真实命中总数（树里每文件只列前 3000 条）
+            real = len(self._hit_order)
+            self.result_filter_info.setText(f"共 {real} 处" if real else "")
         else:
             self.result_filter_info.setText(f"显示 {shown}/{total} 条")
 

@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--type", dest="type_group", default="全部", help=f"类型分组: {', '.join(KIND_GROUPS)}")
     p.add_argument("--ext", default="", help="扩展名白名单，逗号分隔，如 .txt,.docx,.db")
     p.add_argument("--exclude", action="append", default=[], help="排除 glob，可多次")
-    p.add_argument("--max-hits", type=int, default=300, help="单文件最多命中数")
+    p.add_argument("--max-hits", type=int, default=0, help="单文件最多命中数（0=不限，默认）")
     p.add_argument("--context", type=int, default=60, help="上下文长度")
     p.add_argument("--workers", type=int, default=0, help="并发度（0=自动）")
     p.add_argument("--backend", default="auto", choices=["auto", "process", "thread"], help="并行后端")

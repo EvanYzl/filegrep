@@ -34,6 +34,9 @@ __all__ = ["SearchConfig", "SearchEngine", "FileResult", "SearchReport",
            "build_pattern", "iter_files", "DEFAULT_EXCLUDES", "KIND_GROUPS",
            "survey", "load_document", "regex_flags"]
 
+# 绝对上限：即便用户选择"不限"，也避免正则如 "." 把内存打爆
+HARD_HITS_PER_FILE = 1_000_000
+
 DEFAULT_EXCLUDES = [
     "**/.git/**", "**/.svn/**", "**/.hg/**", "**/node_modules/**", "**/__pycache__/**",
     "**/.venv/**", "**/venv/**", "**/.idea/**", "**/.mypy_cache/**", "**/.DS_Store",
@@ -112,8 +115,8 @@ class SearchConfig:
     include_hidden: bool = True
     follow_symlinks: bool = False
     max_file_size: int = 512 * 1024 * 1024
-    max_hits_per_file: int = 300
-    max_total_hits: int = 50000
+    max_hits_per_file: int = 0          # 0 = 不限
+    max_total_hits: int = 500000        # 全局兜底，防止极端模式打爆内存
     context: int = 60
     deep_binary: bool = False
     archives: bool = False
@@ -386,7 +389,9 @@ def search_document(doc: Document, pattern: Pattern[str], cfg: SearchConfig,
             after=text[end:end + ctx_len].replace("\n", " "),
             text_len=len(text),
         ))
-        if len(hits) >= cfg.max_hits_per_file:
+        if cfg.max_hits_per_file and len(hits) >= cfg.max_hits_per_file:
+            break
+        if len(hits) >= HARD_HITS_PER_FILE:
             break
     return hits
 
@@ -482,7 +487,7 @@ def scan_one(path: str, rel: str, st_size: int, st_mtime_ns: int,
                           error=doc.error, warning=doc.warning,
                           elapsed=time.perf_counter() - t0,
                           chars=len(doc.text), cached=False,
-                          truncated=len(hits) >= cfg.max_hits_per_file,
+                          truncated=bool(cfg.max_hits_per_file) and len(hits) >= cfg.max_hits_per_file,
                           doc=doc if cfg.keep_docs else None)
 
     doc: Optional[Document] = None
