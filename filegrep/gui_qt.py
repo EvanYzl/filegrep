@@ -413,8 +413,8 @@ class ResultTree(QTreeWidget):
         self.setRootIsDecorated(True)
         self.setItemDelegateForColumn(3, SnippetDelegate(self))
         self.header().setStretchLastSection(True)
-        self.setColumnWidth(0, 300)
-        self.setColumnWidth(1, 140)
+        self.setColumnWidth(0, 250)
+        self.setColumnWidth(1, 120)
         self.setColumnWidth(2, 46)
         self.itemActivated.connect(self._on_open)
         self.itemClicked.connect(self._on_item)
@@ -1073,6 +1073,9 @@ class MainWindow(QMainWindow):
         self.filter_edit.setPlaceholderText("在结果中过滤：空格分隔多个词，-词 表示排除")
         self.filter_edit.setClearButtonEnabled(True)
         self.filter_edit.textChanged.connect(self.apply_filter)
+        self.result_filter_info = QLabel("")
+        self.result_filter_info.setObjectName("filterInfo")
+        self.result_filter_info.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
         btn_expand = QToolButton()
         btn_expand.setText("展开")
         btn_expand.clicked.connect(lambda: self.tree.expandAll())
@@ -1080,6 +1083,7 @@ class MainWindow(QMainWindow):
         btn_collapse.setText("折叠")
         btn_collapse.clicked.connect(lambda: self.tree.collapseAll())
         frow.addWidget(self.filter_edit, 1)
+        frow.addWidget(self.result_filter_info)
         frow.addWidget(btn_expand)
         frow.addWidget(btn_collapse)
         rv.addLayout(frow)
@@ -1138,14 +1142,18 @@ class MainWindow(QMainWindow):
         self.btn_filter_clear.clicked.connect(self.clear_doc_filters)
         self.filter_info = QLabel("")
         self.filter_info.setObjectName("filterInfo")
-        self.filter_info.setMinimumWidth(130)
         self.filter_info.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.filter_info.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        self.doc_filter_edit.setMinimumWidth(140)
+        self.doc_filter_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for b in (self.btn_filter_prev, self.btn_filter_next, self.btn_filter_clear):
+            b.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         find_row.addWidget(self.filter_mode_combo)
         find_row.addWidget(self.doc_filter_edit, 1)
-        find_row.addWidget(self.filter_info)
         find_row.addWidget(self.btn_filter_prev)
         find_row.addWidget(self.btn_filter_next)
         find_row.addWidget(self.btn_filter_clear)
+        find_row.setStretch(1, 1)
         pv.addLayout(find_row)
 
         self.filter_chips = QWidget()
@@ -1153,7 +1161,7 @@ class MainWindow(QMainWindow):
         self.filter_chips_layout.setContentsMargins(0, 0, 0, 0)
         self.filter_chips_layout.setSpacing(6)
         self.filter_chips_layout.addStretch(1)
-        self.filter_chips.setVisible(False)
+        self.filter_chips_layout.addWidget(self.filter_info)
         pv.addWidget(self.filter_chips)
 
         self.editor = PreviewEdit()
@@ -1460,7 +1468,10 @@ class MainWindow(QMainWindow):
             self._flush_timer.stop()
 
     def _add_file_item(self, fr: FileResult) -> None:
-        top = QTreeWidgetItem([f"{fr.display_name}   ({len(fr.hits)})", "", "",
+        # 压缩包成员显示 member 相对路径（如 inner/报告.docx），普通文件显示相对路径，
+        # 这样包内包外的同名文件也能区分；完整路径在 tooltip 里
+        short = fr.display_name or os.path.basename(fr.path)
+        top = QTreeWidgetItem([f"{short}   ({len(fr.hits)})", "", "",
                                f"{fr.kind} · {fr.chars:,} 字符"])
         top.setData(0, Qt.ItemDataRole.UserRole, fr)
         top.setToolTip(0, fr.path.replace("::", "  ›  "))
@@ -1530,6 +1541,7 @@ class MainWindow(QMainWindow):
         self._update_cache_label()
         self.search_thread = None
         self.statusBar().clearMessage()
+        self.apply_filter(self.filter_edit.text())
         if self.tree.topLevelItemCount():
             self.tree.sortItems(0, Qt.SortOrder.AscendingOrder)
             top = self.tree.topLevelItem(0)
@@ -1837,7 +1849,8 @@ class MainWindow(QMainWindow):
         self._update_filter_info()
 
     def _update_chips(self) -> None:
-        while self.filter_chips_layout.count() > 1:
+        # 布局尾部固定是 [stretch, filter_info]，只回收中间的 chip
+        while self.filter_chips_layout.count() > 2:
             item = self.filter_chips_layout.takeAt(0)
             w = item.widget()
             if w is not None:
@@ -1850,8 +1863,8 @@ class MainWindow(QMainWindow):
             btn.setToolTip(f"{'排除' if exc else '包含'}：{term}（点击移除）")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda _checked=False, idx=i: self.remove_doc_filter_at(idx))
-            self.filter_chips_layout.insertWidget(self.filter_chips_layout.count() - 1, btn)
-        self.filter_chips.setVisible(bool(self._doc_terms))
+            self.filter_chips_layout.insertWidget(self.filter_chips_layout.count() - 2, btn)
+
 
     def _update_filter_info(self) -> None:
         if not self._doc_terms:
@@ -2170,17 +2183,25 @@ class MainWindow(QMainWindow):
         parts = [p for p in (text or "").split() if p]
         include = [p.lower() for p in parts if not p.startswith(("-", "!"))]
         exclude = [p.lstrip("-!").lower() for p in parts if p.startswith(("-", "!")) and len(p) > 1]
+        total = 0
+        shown = 0
         for i in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(i)
             visible = 0
             for j in range(top.childCount()):
                 ch = top.child(j)
+                total += 1
                 hay = ((ch.text(3) or "") + " " + (ch.text(1) or "") + " " + (ch.text(0) or "")).lower()
                 show = all(k in hay for k in include) and not any(k in hay for k in exclude)
                 ch.setHidden(not show)
                 if show:
                     visible += 1
+                    shown += 1
             top.setHidden(visible == 0 and bool(parts))
+        if not parts:
+            self.result_filter_info.setText(f"{total} 条" if total else "")
+        else:
+            self.result_filter_info.setText(f"显示 {shown}/{total} 条")
 
 
 # ---------------------------------------------------------------------------
