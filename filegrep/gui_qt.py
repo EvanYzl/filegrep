@@ -98,6 +98,10 @@ QToolButton { background: transparent; border: 1px solid transparent; border-rad
     padding: 3px 9px; color: #5f6b76; }
 QToolButton:hover { background: #f1f5f9; border-color: #e3e8ee; }
 QLabel#hint { color: #6b7280; }
+QToolButton#chip { background: #eef3f9; border: 1px solid #dbe4ee; border-radius: 10px;
+    padding: 2px 9px; color: #33475b; font-size: 12px; }
+QToolButton#chip:hover { background: #e3ecf6; border-color: #c9d8e8; }
+QLabel#filterInfo { color: #3f6ea8; }
 QLabel#title { color: #55606b; }
 """
 
@@ -151,6 +155,7 @@ class PreviewEdit(QPlainTextEdit):
     """只读预览：行号栏、命中高亮、滚动到底自动加载下一段。"""
 
     needMore = Signal()
+    filterRequested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -230,6 +235,15 @@ class PreviewEdit(QPlainTextEdit):
     def _emit_more(self) -> None:
         self._at_end = False
         self.needMore.emit()
+
+    def contextMenuEvent(self, event) -> None:
+        menu = self.createStandardContextMenu()
+        sel = self.textCursor().selectedText().replace("\u2029", " ").strip()
+        if 0 < len(sel) <= 200:
+            menu.addSeparator()
+            act = menu.addAction(f'用「{sel[:24]}{"…" if len(sel) > 24 else ""}」继续筛选')
+            act.triggered.connect(lambda: self.filterRequested.emit(sel))
+        menu.exec(event.globalPos())
 
     def set_line_offset(self, offset: int) -> None:
         self._line_offset = max(0, int(offset))
@@ -908,6 +922,10 @@ class MainWindow(QMainWindow):
         self._loaded_chars = 0
         self._browse_mode = False
         self._windowed = False
+        self._doc_terms: List[str] = []
+        self._doc_match_lines: List[tuple] = []
+        self._doc_match_index = 0
+        self._win_len = 0
         self._last_browse: Optional[str] = None
 
         self.setStyleSheet(STYLE)
@@ -1091,8 +1109,42 @@ class MainWindow(QMainWindow):
                 QPlainTextEdit.LineWrapMode.WidgetWidth if on else QPlainTextEdit.LineWrapMode.NoWrap))
         head.addWidget(self.wrap_check)
         pv.addLayout(head)
+
+        # 文件内查找条
+        find_row = QHBoxLayout()
+        find_row.setSpacing(6)
+        self.doc_filter_edit = QLineEdit()
+        self.doc_filter_edit.setPlaceholderText("在当前文件里继续查找，回车叠加一个条件（多个条件同时满足）")
+        self.doc_filter_edit.setClearButtonEnabled(True)
+        self.doc_filter_edit.returnPressed.connect(self.add_doc_filter)
+        self.btn_filter_prev = QPushButton("上一处")
+        self.btn_filter_prev.clicked.connect(lambda: self.goto_doc_match(-1))
+        self.btn_filter_next = QPushButton("下一处")
+        self.btn_filter_next.clicked.connect(lambda: self.goto_doc_match(1))
+        self.btn_filter_clear = QPushButton("清除")
+        self.btn_filter_clear.clicked.connect(self.clear_doc_filters)
+        self.filter_info = QLabel("")
+        self.filter_info.setObjectName("filterInfo")
+        self.filter_info.setMinimumWidth(130)
+        self.filter_info.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        find_row.addWidget(self.doc_filter_edit, 1)
+        find_row.addWidget(self.filter_info)
+        find_row.addWidget(self.btn_filter_prev)
+        find_row.addWidget(self.btn_filter_next)
+        find_row.addWidget(self.btn_filter_clear)
+        pv.addLayout(find_row)
+
+        self.filter_chips = QWidget()
+        self.filter_chips_layout = QHBoxLayout(self.filter_chips)
+        self.filter_chips_layout.setContentsMargins(0, 0, 0, 0)
+        self.filter_chips_layout.setSpacing(6)
+        self.filter_chips_layout.addStretch(1)
+        self.filter_chips.setVisible(False)
+        pv.addWidget(self.filter_chips)
+
         self.editor = PreviewEdit()
         self.editor.needMore.connect(self._load_more)
+        self.editor.filterRequested.connect(self.add_doc_filter)
         pv.addWidget(self.editor, 1)
 
         self.detail = QTextBrowser()
@@ -1567,6 +1619,11 @@ class MainWindow(QMainWindow):
         self.current_path = getattr(doc, "path", None)
         self._full_text = doc.text or ""
         self._loaded_chars = 0
+        self._doc_terms = []
+        self._doc_match_lines = []
+        self._doc_match_index = 0
+        self._update_chips()
+        self._update_filter_info()
         # 数据库：自动装载查询面板
         if self.current_path and os.path.splitext(self.current_path)[1].lower() in DB_SUFFIXES:
             if self.db_panel.path != self.current_path:
@@ -1578,6 +1635,9 @@ class MainWindow(QMainWindow):
     def _render_current(self) -> None:
         doc = self.current_doc
         if doc is None:
+            return
+        if self._doc_terms:
+            self._render_filtered(None)
             return
         hit = self.current_hit
         text = self._full_text
@@ -1698,6 +1758,205 @@ class MainWindow(QMainWindow):
             self.editor.centerCursor()
         except Exception:
             pass
+
+    # -- 文件内继续查找（可叠加多个条件） -------------------------------
+    def add_doc_filter(self, text=None) -> None:
+        if self.current_doc is None:
+            self._flash("请先打开一个文件")
+            return
+        term = (text if isinstance(text, str) else self.doc_filter_edit.text()).strip()
+        if not term:
+            return
+        if term in self._doc_terms:
+            self.doc_filter_edit.clear()
+            return
+        self._doc_terms.append(term)
+        self.doc_filter_edit.clear()
+        self._update_chips()
+        self._compute_doc_matches()
+        self._doc_match_index = 0
+        center = self._doc_match_lines[0][0] if self._doc_match_lines else None
+        self._render_filtered(center)
+        self._update_filter_info()
+
+    def remove_doc_filter(self, term: str) -> None:
+        if term in self._doc_terms:
+            self._doc_terms.remove(term)
+            self._update_chips()
+            self._compute_doc_matches()
+            self._doc_match_index = 0
+            if self._doc_terms:
+                center = self._doc_match_lines[0][0] if self._doc_match_lines else None
+                self._render_filtered(center)
+            else:
+                self._render_current()
+            self._update_filter_info()
+
+    def clear_doc_filters(self) -> None:
+        if not self._doc_terms:
+            return
+        self._doc_terms = []
+        self._doc_match_lines = []
+        self._doc_match_index = 0
+        self._update_chips()
+        self._update_filter_info()
+        self._render_current()
+
+    def goto_doc_match(self, step: int) -> None:
+        if not self._doc_terms:
+            return
+        if not self._doc_match_lines:
+            self._flash("当前没有满足所有条件的行")
+            return
+        self._doc_match_index = (self._doc_match_index + step) % len(self._doc_match_lines)
+        self._render_filtered(self._doc_match_lines[self._doc_match_index][0])
+        self._update_filter_info()
+
+    def _update_chips(self) -> None:
+        while self.filter_chips_layout.count() > 1:
+            item = self.filter_chips_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        for term in self._doc_terms:
+            btn = QToolButton()
+            label = term if len(term) <= 18 else term[:16] + "…"
+            btn.setText(f"{label}  ×")
+            btn.setObjectName("chip")
+            btn.setToolTip(f"{term}（点击移除）")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _checked=False, t=term: self.remove_doc_filter(t))
+            self.filter_chips_layout.insertWidget(self.filter_chips_layout.count() - 1, btn)
+        self.filter_chips.setVisible(bool(self._doc_terms))
+
+    def _update_filter_info(self) -> None:
+        if not self._doc_terms:
+            self.filter_info.setText("")
+            return
+        n = len(self._doc_match_lines)
+        if n:
+            self.filter_info.setText(f"{n} 行匹配 · 第 {self._doc_match_index + 1}/{n}")
+        else:
+            self.filter_info.setText("0 行匹配")
+
+    def _compute_doc_matches(self) -> None:
+        terms = [t for t in self._doc_terms if t]
+        self._doc_match_lines = []
+        if not terms or not self._full_text:
+            return
+        ci = (self.case_combo.currentData() or "smart") != "sensitive"
+        hay = self._full_text.lower() if ci else self._full_text
+        needles = [t.lower() for t in terms] if ci else terms
+        pos = 0
+        n = len(hay)
+        cap = 20000
+        while pos < n and len(self._doc_match_lines) < cap:
+            nl = hay.find("\n", pos)
+            end = n if nl < 0 else nl
+            if all(nd in hay[pos:end] for nd in needles):
+                self._doc_match_lines.append((pos, end))
+            pos = end + 1
+
+    def _window_slice(self, center: int):
+        text = self._full_text
+        WIN = self.PREVIEW_WINDOW
+        if len(text) <= WIN:
+            return 0, text, 0
+        base = max(0, min(center - WIN // 3, len(text) - WIN))
+        if base > 0:
+            nl = text.rfind("\n", 0, base)
+            base = nl + 1 if nl >= 0 else base
+        window = text[base:base + WIN]
+        offset = self.current_doc.line_of(base) - 1 if self.current_doc else 0
+        return base, window, offset
+
+    def _render_filtered(self, center: Optional[int]) -> None:
+        doc = self.current_doc
+        if doc is None:
+            return
+        if center is None:
+            center = self._doc_match_lines[0][0] if self._doc_match_lines else 0
+        self._windowed = len(self._full_text) > self.PREVIEW_WINDOW
+        base, window, line_offset = self._window_slice(center)
+        self._window_base = base
+        self._win_len = len(window)
+        self.editor.blockSignals(True)
+        try:
+            self.editor.setPlainText(safe_text(window))
+        finally:
+            self.editor.blockSignals(False)
+        self.editor.set_line_offset(line_offset)
+        self._apply_filter_selections()
+        pos = max(0, min(len(window), center - base))
+        nav = QTextCursor(self.editor.document())
+        nav.setPosition(pos)
+        self.editor.setTextCursor(nav)
+        self.editor.ensureCursorVisible()
+        QTimer.singleShot(0, self._center_on_hit)
+        cond = " + ".join(self._doc_terms)
+        if self._doc_match_lines:
+            title = f"{os.path.basename(doc.path)} · 文件内筛选：{cond}"
+        else:
+            title = f"{os.path.basename(doc.path)} · 没有同时满足「{cond}」的行（下方为全文）"
+        self.preview_title.setText(title)
+
+    def _apply_filter_selections(self) -> None:
+        window = self.editor.toPlainText()
+        if not window:
+            return
+        base = self._window_base
+        wend = base + len(window)
+        terms = [t for t in self._doc_terms if t]
+        ci = (self.case_combo.currentData() or "smart") != "sensitive"
+        low = window.lower() if ci else window
+        needles = [t.lower() for t in terms] if ci else list(terms)
+        cur = None
+        if 0 <= self._doc_match_index < len(self._doc_match_lines):
+            cur = self._doc_match_lines[self._doc_match_index][0]
+        sels: List[QTextEdit.ExtraSelection] = []
+
+        def add(a: int, b: int, bg: QColor, fg: Optional[QColor] = None) -> None:
+            if b <= a:
+                return
+            sel = QTextEdit.ExtraSelection()
+            fmt = QTextCharFormat()
+            fmt.setBackground(bg)
+            if fg is not None:
+                fmt.setForeground(fg)
+            cur_cur = QTextCursor(self.editor.document())
+            cur_cur.setPosition(max(0, a))
+            cur_cur.setPosition(max(a, b), QTextCursor.MoveMode.KeepAnchor)
+            sel.format = fmt
+            sel.cursor = cur_cur
+            sels.append(sel)
+
+        # 1) 命中行整行底色
+        shown = 0
+        for ls, le in self._doc_match_lines:
+            if le <= base or ls >= wend:
+                continue
+            shown += 1
+            if shown > 4000:
+                break
+            a = max(0, ls - base)
+            b = min(len(window), le - base)
+            add(a, b, QColor("#fff2cc") if cur != ls else QColor("#ffd28a"))
+        # 2) 关键词高亮
+        for ls, le in self._doc_match_lines:
+            if le <= base or ls >= wend:
+                continue
+            a = max(0, ls - base)
+            b = min(len(window), le - base)
+            line_low = low[a:b]
+            for nd in needles:
+                p = 0
+                while True:
+                    j = line_low.find(nd, p)
+                    if j < 0:
+                        break
+                    add(a + j, a + j + len(nd), QColor("#ffca28"), QColor("#4a3200"))
+                    p = j + len(nd)
+        self.editor.setExtraSelections(sels)
 
     def _render_detail(self, doc, hit) -> None:
         meta = hit.meta or {}
