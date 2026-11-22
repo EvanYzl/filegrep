@@ -101,6 +101,9 @@ QLabel#hint { color: #6b7280; }
 QToolButton#chip { background: #eef3f9; border: 1px solid #dbe4ee; border-radius: 10px;
     padding: 2px 9px; color: #33475b; font-size: 12px; }
 QToolButton#chip:hover { background: #e3ecf6; border-color: #c9d8e8; }
+QToolButton#chipExclude { background: #fdeeee; border: 1px solid #f2d4d4; border-radius: 10px;
+    padding: 2px 9px; color: #a03a3a; font-size: 12px; }
+QToolButton#chipExclude:hover { background: #fbdede; border-color: #e9c2c2; }
 QLabel#filterInfo { color: #3f6ea8; }
 QLabel#title { color: #55606b; }
 """
@@ -156,6 +159,7 @@ class PreviewEdit(QPlainTextEdit):
 
     needMore = Signal()
     filterRequested = Signal(str)
+    excludeRequested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -241,8 +245,11 @@ class PreviewEdit(QPlainTextEdit):
         sel = self.textCursor().selectedText().replace("\u2029", " ").strip()
         if 0 < len(sel) <= 200:
             menu.addSeparator()
-            act = menu.addAction(f'用「{sel[:24]}{"…" if len(sel) > 24 else ""}」继续筛选')
+            short = sel[:24] + ("…" if len(sel) > 24 else "")
+            act = menu.addAction(f'用「{short}」继续筛选（包含）')
             act.triggered.connect(lambda: self.filterRequested.emit(sel))
+            act2 = menu.addAction(f'排除含「{short}」的行')
+            act2.triggered.connect(lambda: self.excludeRequested.emit(sel))
         menu.exec(event.globalPos())
 
     def set_line_offset(self, offset: int) -> None:
@@ -922,7 +929,7 @@ class MainWindow(QMainWindow):
         self._loaded_chars = 0
         self._browse_mode = False
         self._windowed = False
-        self._doc_terms: List[str] = []
+        self._doc_terms: List[tuple] = []
         self._doc_match_lines: List[tuple] = []
         self._doc_match_index = 0
         self._win_len = 0
@@ -1063,7 +1070,7 @@ class MainWindow(QMainWindow):
         rv.setSpacing(4)
         frow = QHBoxLayout()
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("在结果中过滤…")
+        self.filter_edit.setPlaceholderText("在结果中过滤：空格分隔多个词，-词 表示排除")
         self.filter_edit.setClearButtonEnabled(True)
         self.filter_edit.textChanged.connect(self.apply_filter)
         btn_expand = QToolButton()
@@ -1113,8 +1120,14 @@ class MainWindow(QMainWindow):
         # 文件内查找条
         find_row = QHBoxLayout()
         find_row.setSpacing(6)
+        self.filter_mode_combo = QComboBox()
+        self.filter_mode_combo.addItem("包含", "include")
+        self.filter_mode_combo.addItem("排除", "exclude")
+        self.filter_mode_combo.setToolTip("选择新条件的极性；也可在输入开头写 - 或 ! 直接表示排除")
+        self.filter_mode_combo.setMaximumWidth(86)
         self.doc_filter_edit = QLineEdit()
-        self.doc_filter_edit.setPlaceholderText("在当前文件里继续查找，回车叠加一个条件（多个条件同时满足）")
+        self.doc_filter_edit.setPlaceholderText(
+            "在当前文件里继续查找：回车叠加一个条件（同时满足）；以 - 或 ! 开头表示排除")
         self.doc_filter_edit.setClearButtonEnabled(True)
         self.doc_filter_edit.returnPressed.connect(self.add_doc_filter)
         self.btn_filter_prev = QPushButton("上一处")
@@ -1127,6 +1140,7 @@ class MainWindow(QMainWindow):
         self.filter_info.setObjectName("filterInfo")
         self.filter_info.setMinimumWidth(130)
         self.filter_info.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        find_row.addWidget(self.filter_mode_combo)
         find_row.addWidget(self.doc_filter_edit, 1)
         find_row.addWidget(self.filter_info)
         find_row.addWidget(self.btn_filter_prev)
@@ -1145,6 +1159,7 @@ class MainWindow(QMainWindow):
         self.editor = PreviewEdit()
         self.editor.needMore.connect(self._load_more)
         self.editor.filterRequested.connect(self.add_doc_filter)
+        self.editor.excludeRequested.connect(self.add_doc_filter_exclude)
         pv.addWidget(self.editor, 1)
 
         self.detail = QTextBrowser()
@@ -1760,37 +1775,46 @@ class MainWindow(QMainWindow):
             pass
 
     # -- 文件内继续查找（可叠加多个条件） -------------------------------
-    def add_doc_filter(self, text=None) -> None:
+    def add_doc_filter(self, text=None, exclude: Optional[bool] = None) -> None:
         if self.current_doc is None:
             self._flash("请先打开一个文件")
             return
-        term = (text if isinstance(text, str) else self.doc_filter_edit.text()).strip()
-        if not term:
+        raw = (text if isinstance(text, str) else self.doc_filter_edit.text()).strip()
+        if not raw:
             return
-        if term in self._doc_terms:
+        if exclude is None:
+            exclude = self.filter_mode_combo.currentData() == "exclude"
+            if raw[0] in "-!" and len(raw) > 1:
+                exclude = True
+                raw = raw[1:].strip()
+        if not raw:
+            return
+        item = (raw, bool(exclude))
+        if item in self._doc_terms:
             self.doc_filter_edit.clear()
             return
-        self._doc_terms.append(term)
+        self._doc_terms.append(item)
         self.doc_filter_edit.clear()
+        self._apply_doc_filter_change()
+
+    def add_doc_filter_exclude(self, text: str) -> None:
+        self.add_doc_filter(text, exclude=True)
+
+    def remove_doc_filter_at(self, index: int) -> None:
+        if 0 <= index < len(self._doc_terms):
+            del self._doc_terms[index]
+            self._apply_doc_filter_change()
+
+    def _apply_doc_filter_change(self) -> None:
         self._update_chips()
         self._compute_doc_matches()
         self._doc_match_index = 0
-        center = self._doc_match_lines[0][0] if self._doc_match_lines else None
-        self._render_filtered(center)
+        if self._doc_terms:
+            center = self._doc_match_lines[0][0] if self._doc_match_lines else None
+            self._render_filtered(center)
+        else:
+            self._render_current()
         self._update_filter_info()
-
-    def remove_doc_filter(self, term: str) -> None:
-        if term in self._doc_terms:
-            self._doc_terms.remove(term)
-            self._update_chips()
-            self._compute_doc_matches()
-            self._doc_match_index = 0
-            if self._doc_terms:
-                center = self._doc_match_lines[0][0] if self._doc_match_lines else None
-                self._render_filtered(center)
-            else:
-                self._render_current()
-            self._update_filter_info()
 
     def clear_doc_filters(self) -> None:
         if not self._doc_terms:
@@ -1818,14 +1842,14 @@ class MainWindow(QMainWindow):
             w = item.widget()
             if w is not None:
                 w.deleteLater()
-        for term in self._doc_terms:
+        for i, (term, exc) in enumerate(self._doc_terms):
             btn = QToolButton()
             label = term if len(term) <= 18 else term[:16] + "…"
-            btn.setText(f"{label}  ×")
-            btn.setObjectName("chip")
-            btn.setToolTip(f"{term}（点击移除）")
+            btn.setText(f"{'− ' if exc else ''}{label}  ×")
+            btn.setObjectName("chipExclude" if exc else "chip")
+            btn.setToolTip(f"{'排除' if exc else '包含'}：{term}（点击移除）")
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.clicked.connect(lambda _checked=False, t=term: self.remove_doc_filter(t))
+            btn.clicked.connect(lambda _checked=False, idx=i: self.remove_doc_filter_at(idx))
             self.filter_chips_layout.insertWidget(self.filter_chips_layout.count() - 1, btn)
         self.filter_chips.setVisible(bool(self._doc_terms))
 
@@ -1840,20 +1864,22 @@ class MainWindow(QMainWindow):
             self.filter_info.setText("0 行匹配")
 
     def _compute_doc_matches(self) -> None:
-        terms = [t for t in self._doc_terms if t]
         self._doc_match_lines = []
-        if not terms or not self._full_text:
+        if not self._doc_terms or not self._full_text:
             return
         ci = (self.case_combo.currentData() or "smart") != "sensitive"
         hay = self._full_text.lower() if ci else self._full_text
-        needles = [t.lower() for t in terms] if ci else terms
+        norm = (lambda x: x.lower()) if ci else (lambda x: x)
+        inc = [norm(t) for t, ex in self._doc_terms if not ex]
+        exc = [norm(t) for t, ex in self._doc_terms if ex]
         pos = 0
         n = len(hay)
         cap = 20000
         while pos < n and len(self._doc_match_lines) < cap:
             nl = hay.find("\n", pos)
             end = n if nl < 0 else nl
-            if all(nd in hay[pos:end] for nd in needles):
+            line = hay[pos:end]
+            if all(nd in line for nd in inc) and not any(nd in line for nd in exc):
                 self._doc_match_lines.append((pos, end))
             pos = end + 1
 
@@ -1893,11 +1919,18 @@ class MainWindow(QMainWindow):
         self.editor.setTextCursor(nav)
         self.editor.ensureCursorVisible()
         QTimer.singleShot(0, self._center_on_hit)
-        cond = " + ".join(self._doc_terms)
+        inc_list = [t for t, ex in self._doc_terms if not ex]
+        exc_list = [t for t, ex in self._doc_terms if ex]
+        parts = []
+        if inc_list:
+            parts.append(" + ".join(inc_list))
+        if exc_list:
+            parts.append("排除 " + " / ".join(exc_list))
+        cond = "；".join(parts)
         if self._doc_match_lines:
             title = f"{os.path.basename(doc.path)} · 文件内筛选：{cond}"
         else:
-            title = f"{os.path.basename(doc.path)} · 没有同时满足「{cond}」的行（下方为全文）"
+            title = f"{os.path.basename(doc.path)} · 没有满足「{cond}」的行（下方为全文）"
         self.preview_title.setText(title)
 
     def _apply_filter_selections(self) -> None:
@@ -1906,10 +1939,9 @@ class MainWindow(QMainWindow):
             return
         base = self._window_base
         wend = base + len(window)
-        terms = [t for t in self._doc_terms if t]
         ci = (self.case_combo.currentData() or "smart") != "sensitive"
         low = window.lower() if ci else window
-        needles = [t.lower() for t in terms] if ci else list(terms)
+        needles = [t.lower() if ci else t for t, ex in self._doc_terms if not ex]
         cur = None
         if 0 <= self._doc_match_index < len(self._doc_match_lines):
             cur = self._doc_match_lines[self._doc_match_index][0]
@@ -2134,18 +2166,21 @@ class MainWindow(QMainWindow):
                           "<br>⌘F 正则 · ⌘L 目录 · F3 下一个 · ⌘Shift+R 在 Finder 显示 · ⌘1/⌘2 切页")
 
     def apply_filter(self, text: str) -> None:
-        text = text.strip().lower()
+        """结果列表过滤：空格分隔多个词（AND），以 - 或 ! 开头表示排除。"""
+        parts = [p for p in (text or "").split() if p]
+        include = [p.lower() for p in parts if not p.startswith(("-", "!"))]
+        exclude = [p.lstrip("-!").lower() for p in parts if p.startswith(("-", "!")) and len(p) > 1]
         for i in range(self.tree.topLevelItemCount()):
             top = self.tree.topLevelItem(i)
             visible = 0
             for j in range(top.childCount()):
                 ch = top.child(j)
-                show = (not text) or (text in (ch.text(3) or "").lower()) or \
-                       (text in (ch.text(1) or "").lower())
+                hay = ((ch.text(3) or "") + " " + (ch.text(1) or "") + " " + (ch.text(0) or "")).lower()
+                show = all(k in hay for k in include) and not any(k in hay for k in exclude)
                 ch.setHidden(not show)
                 if show:
                     visible += 1
-            top.setHidden(visible == 0 and bool(text))
+            top.setHidden(visible == 0 and bool(parts))
 
 
 # ---------------------------------------------------------------------------
