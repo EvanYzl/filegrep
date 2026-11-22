@@ -1042,25 +1042,42 @@ def extract_sqlite(src: Source, ctx: ExtractContext) -> Document:
                         continue
                 tables.append(name)
                 b.add(f"表结构 {name}", sql or "", {"table": name, "schema": True})
+                quoted = name.replace('"', '""')
+                cur = None
+                has_rowid = False
                 try:
-                    cur = con.execute(f'SELECT * FROM "{name.replace(chr(34), chr(34) * 2)}" LIMIT {int(ctx.sqlite_max_rows) + 1}')
-                except sqlite3.DatabaseError as e:
-                    ctx.warn(f"表 {name} 读取失败: {e}")
-                    continue
+                    # 带上 rowid，便于界面精确跳转到该行
+                    cur = con.execute(
+                        f'SELECT rowid AS __fg_rowid, * FROM "{quoted}" '
+                        f'LIMIT {int(ctx.sqlite_max_rows) + 1}')
+                    has_rowid = True
+                except sqlite3.DatabaseError:
+                    try:
+                        cur = con.execute(
+                            f'SELECT * FROM "{quoted}" LIMIT {int(ctx.sqlite_max_rows) + 1}')
+                    except sqlite3.DatabaseError as e:
+                        ctx.warn(f"表 {name} 读取失败: {e}")
+                        continue
                 cols = [d[0] for d in (cur.description or [])]
+                if has_rowid:
+                    cols = cols[1:]
                 n = 0
                 for n, rec in enumerate(cur, 1):
                     if n > ctx.sqlite_max_rows:
                         ctx.warn(f"表 {name} 超过 {ctx.sqlite_max_rows} 行，已截断")
                         break
+                    rowid = rec[0] if has_rowid else None
+                    vals = rec[1:] if has_rowid else rec
                     pieces = []
                     values: Dict[str, str] = {}
-                    for col, val in zip(cols, rec):
+                    for col, val in zip(cols, vals):
                         sval = _cell_to_text(val)
                         values[col] = sval[:512]
                         pieces.append(f"{col}={sval}")
-                    b.add(f"表 {name} · 第 {n} 行", " | ".join(pieces),
-                          {"table": name, "row": n, "columns": values})
+                    meta: Dict[str, Any] = {"table": name, "row": n, "columns": values}
+                    if rowid is not None:
+                        meta["rowid"] = rowid
+                    b.add(f"表 {name} · 第 {n} 行", " | ".join(pieces), meta)
                     if b.truncated:
                         break
                 if b.truncated:

@@ -21,7 +21,7 @@ from .model import Document, Segment
 
 __all__ = ["DocCache", "get_cache", "CACHE_VERSION"]
 
-CACHE_VERSION = "2"        # 解析逻辑变化时 +1，全量失效
+CACHE_VERSION = "3"        # 解析逻辑变化时 +1，全量失效
 
 
 def _default_dir() -> str:

@@ -379,7 +379,8 @@ class DirScanner(QThread):
 # ---------------------------------------------------------------------------
 
 class ResultTree(QTreeWidget):
-    hitActivated = Signal(object)
+    hitActivated = Signal(object)        # 单击：文本预览定位
+    hitOpened = Signal(object)           # 双击 / 回车：数据库命中直接跳到对应行
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -394,13 +395,20 @@ class ResultTree(QTreeWidget):
         self.setColumnWidth(0, 300)
         self.setColumnWidth(1, 140)
         self.setColumnWidth(2, 46)
-        self.itemActivated.connect(self._on_item)
+        self.itemActivated.connect(self._on_open)
         self.itemClicked.connect(self._on_item)
 
     def _on_item(self, item: QTreeWidgetItem, column: int) -> None:
         hit = item.data(0, Qt.ItemDataRole.UserRole + 1)
         if hit is not None:
             self.hitActivated.emit(hit)
+        elif item.childCount():
+            item.setExpanded(not item.isExpanded())
+
+    def _on_open(self, item: QTreeWidgetItem, column: int) -> None:
+        hit = item.data(0, Qt.ItemDataRole.UserRole + 1)
+        if hit is not None:
+            self.hitOpened.emit(hit)
         elif item.childCount():
             item.setExpanded(not item.isExpanded())
 
@@ -658,6 +666,8 @@ class DbPanel(QWidget):
 
         self.result = QTableWidget()
         self.result.setAlternatingRowColors(False)
+        self.result.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.result.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.result.setSortingEnabled(False)
         self.result.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         right.addWidget(self.result, 1)
@@ -727,53 +737,112 @@ class DbPanel(QWidget):
         self.sql_edit.setPlainText(f'SELECT * FROM "{name}" LIMIT 200;')
         self.run_sql()
 
+    def _query(self, sql: str, params=()) -> tuple[list, list, bool]:
+        cur = self.conn.execute(sql, params)
+        cols = [d[0] for d in (cur.description or [])]
+        rows = cur.fetchmany(self.max_rows + 1)
+        truncated = len(rows) > self.max_rows
+        return cols, rows[: self.max_rows], truncated
+
+    def _fill(self, cols: list, rows: list, info: str) -> None:
+        self.result.setUpdatesEnabled(False)
+        try:
+            self.result.clear()
+            self.result.setColumnCount(len(cols))
+            self.result.setHorizontalHeaderLabels([str(c) for c in cols])
+            self.result.setRowCount(len(rows))
+            for r, row in enumerate(rows):
+                for c, val in enumerate(row):
+                    if isinstance(val, bytes):
+                        text = "0x" + val[:24].hex() + ("…" if len(val) > 24 else "")
+                    else:
+                        text = "" if val is None else str(val)
+                    item = QTableWidgetItem(text)
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    self.result.setItem(r, c, item)
+        finally:
+            self.result.setUpdatesEnabled(True)
+            self.result.resizeColumnsToContents()
+        self.info.setText(info)
+        self.statusMessage.emit(info)
+
     def run_sql(self) -> None:
         if self.conn is None:
             return
         sql = self.sql_edit.toPlainText().strip()
         if not sql:
             return
-        statements = [s.strip() for s in sql.split(";") if s.strip()]
-        self.result.setUpdatesEnabled(False)
-        try:
-            for idx, stmt in enumerate(statements):
-                if re.match(r"(?i)^\s*(insert|update|delete|drop|alter|create|replace|attach|pragma\s+writable)",
-                            stmt):
-                    self.info.setText("只读模式：已阻止写操作")
-                    continue
-                try:
-                    cur = self.conn.execute(stmt)
-                    cols = [d[0] for d in (cur.description or [])]
-                    rows = cur.fetchmany(self.max_rows + 1)
-                except sqlite3.DatabaseError as e:
-                    self.info.setText(f"SQL 错误：{e}")
-                    self.result.setRowCount(0)
-                    self.result.setColumnCount(0)
-                    return
-                truncated = len(rows) > self.max_rows
-                rows = rows[: self.max_rows]
-                self.result.clear()
-                self.result.setColumnCount(len(cols))
-                self.result.setHorizontalHeaderLabels(cols)
-                self.result.setRowCount(len(rows))
-                for r, row in enumerate(rows):
-                    for c, val in enumerate(row):
-                        if isinstance(val, bytes):
-                            text = "0x" + val[:24].hex() + ("…" if len(val) > 24 else "")
-                        else:
-                            text = "" if val is None else str(val)
-                        item = QTableWidgetItem(text)
-                        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                        self.result.setItem(r, c, item)
-                info = f"返回 {len(rows)} 行 × {len(cols)} 列"
-                if truncated:
-                    info += f"（已截断，最多 {self.max_rows} 行）"
-                self.info.setText(info)
-                self.statusMessage.emit(info)
+        for stmt in [x.strip() for x in sql.split(";") if x.strip()]:
+            if re.match(r"(?i)^\s*(insert|update|delete|drop|alter|create|replace|attach|pragma\s+writable)",
+                        stmt):
+                self.info.setText("只读模式：已阻止写操作")
+                continue
+            try:
+                cols, rows, truncated = self._query(stmt)
+            except sqlite3.DatabaseError as e:
+                self.info.setText(f"SQL 错误：{e}")
+                self.result.setRowCount(0)
+                self.result.setColumnCount(0)
+                return
+            info = f"返回 {len(rows)} 行 × {len(cols)} 列"
+            if truncated:
+                info += f"（已截断，最多 {self.max_rows} 行）"
+            self._fill(cols, rows, info)
+            break
+
+    def locate(self, table: str, rowid=None, row=None) -> None:
+        """跳到指定表的目标行：显示上下各 8 行并选中目标行。"""
+        if self.conn is None:
+            return
+        for i in range(self.tables.count()):
+            if self.tables.item(i).data(Qt.ItemDataRole.UserRole) == table:
+                self.tables.setCurrentRow(i)
                 break
-        finally:
-            self.result.setUpdatesEnabled(True)
-            self.result.resizeColumnsToContents()
+        quoted = table.replace('"', '""')
+        result = None
+        target = 0
+        if rowid is not None:
+            try:
+                lo = max(0, int(rowid) - 8)
+                hi = int(rowid) + 8
+                cols, rows, _ = self._query(
+                    f'SELECT rowid, * FROM "{quoted}" WHERE rowid BETWEEN ? AND ? ORDER BY rowid',
+                    (lo, hi))
+                result = (cols, rows)
+                # 用返回结果里的 rowid 反查下标，避免 lo 与真实 rowid 起点不一致
+                target = 0
+                for i, r in enumerate(rows):
+                    if r and r[0] == int(rowid):
+                        target = i
+                        break
+                self.sql_edit.setPlainText(
+                    f'SELECT rowid, * FROM "{quoted}" WHERE rowid BETWEEN {lo} AND {hi};')
+            except (sqlite3.DatabaseError, TypeError, ValueError):
+                result = None
+        if result is None:
+            try:
+                r0 = int(row or 1)
+                offset = max(0, r0 - 1 - 8)
+                cols, rows, _ = self._query(
+                    f'SELECT * FROM "{quoted}" LIMIT 17 OFFSET ?', (offset,))
+                result = (cols, rows)
+                target = max(0, r0 - 1 - offset)
+                self.sql_edit.setPlainText(
+                    f'SELECT * FROM "{quoted}" LIMIT 17 OFFSET {offset};')
+            except (sqlite3.DatabaseError, TypeError, ValueError) as e:
+                self.info.setText(f"定位失败：{e}")
+                return
+        cols, rows = result
+        if rows and not (0 <= target < len(rows)):
+            target = 0
+        extra = f"（rowid={rowid}）" if rowid is not None else ""
+        self._fill(cols, rows, f"已定位 {table} 第 {row} 行{extra}，上下各 8 行")
+        if 0 <= target < len(rows):
+            self.result.selectRow(target)
+            item = self.result.item(target, 0)
+            if item is not None:
+                self.result.scrollToItem(
+                    item, QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def show_schema(self) -> None:
         if self.conn is None:
@@ -984,6 +1053,7 @@ class MainWindow(QMainWindow):
         rv.addLayout(frow)
         self.tree = ResultTree()
         self.tree.hitActivated.connect(self.show_hit)
+        self.tree.hitOpened.connect(self.open_hit_in_db)
         rv.addWidget(self.tree, 1)
         self.left_tabs.addTab(result_page, "结果")
 
@@ -1437,6 +1507,23 @@ class MainWindow(QMainWindow):
         self.current_hit = None
         self._last_browse = path
         self._open_doc(path, goto_hit=None)
+
+    def open_hit_in_db(self, hit) -> None:
+        """双击命中：若来自数据库，切到「数据库」页并选中对应行。"""
+        self.show_hit(hit)
+        meta = hit.meta or {}
+        table = meta.get("table")
+        path = self._fs_path(hit.path)
+        if not table or not path:
+            return
+        if os.path.splitext(path)[1].lower() not in DB_SUFFIXES:
+            return
+        if not os.path.exists(path):
+            return
+        self.right_tabs.setCurrentIndex(1)
+        if self.db_panel.path != path and not self.db_panel.open_db(path):
+            return
+        self.db_panel.locate(table, meta.get("rowid"), meta.get("row"))
 
     def show_hit(self, hit) -> None:
         if hit is None:
