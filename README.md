@@ -23,7 +23,7 @@ FileGrep 把这些格式统一抽成带**结构定位信息**的文本，再跑�
 ## 快速开始
 
 ```bash
-git clone https://github.com/<your-name>/filegrep.git
+git clone https://github.com/EvanYzl/filegrep.git
 cd filegrep
 
 # macOS 双击启动（首次会自动建 venv 并装依赖）
