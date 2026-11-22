@@ -1,0 +1,22 @@
+# 虚拟环境与缓存
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+
+# 本地数据与产物
+tests/samples/
+*.log
+filegrep_hits.*
+query_result.csv
+
+# 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

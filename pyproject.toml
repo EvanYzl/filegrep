@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filegrep"
+version = "1.0.0"
+description = "全格式文件内容检索器：Office / PDF / 数据库 / 压缩包 / 文本，正则搜索 + 命中定位高亮"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Evan" }]
+keywords = ["fulltext-search", "regex", "grep", "office", "pdf", "sqlite", "forensics", "pyside6"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Environment :: X11 Applications :: Qt",
+    "Topic :: Text Processing :: Indexing",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "PySide6-Essentials>=6.5",
+    "openpyxl>=3.1",
+    "python-docx>=1.1",
+    "python-pptx>=0.6.23",
+    "PyMuPDF>=1.24",
+    "pdfplumber>=0.10",
+    "pypdf>=4.0",
+    "xlrd>=2.0",
+    "msoffcrypto-tool>=5.0",
+    "py7zr>=0.21",
+    "rarfile>=4.1",
+    "extract-msg>=0.48",
+    "olefile>=0.47",
+    "charset-normalizer>=3.0",
+    "markitdown>=0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+filegrep = "filegrep.cli:main"
+
+[project.gui-scripts]
+filegrep-gui = "filegrep.gui_qt:main"
+
+[tool.setuptools]
+packages = ["filegrep"]
